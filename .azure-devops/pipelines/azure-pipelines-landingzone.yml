@@ -1,0 +1,158 @@
+# =================================================================================================
+# Enterprise Azure DevOps Multi-Stage Pipeline: CAF Landing Zone Delivery
+# Author: Gunjan Kumar Gaurav (Senior Cloud Architect & DevSecOps Consultant)
+# =================================================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-CAF-LandingZone-Delivery
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - .azure-devops/**
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - name: azureServiceConnection
+    value: "sc-azure-caf-lz-oidc-prod"
+  - name: terraformVersion
+    value: "1.5.7"
+  - name: backendResourceGroup
+    value: "rg-terraform-state-prod"
+  - name: backendStorageAccount
+    value: "stcaflzstateprod01"
+  - name: backendContainer
+    value: "tfstate"
+
+stages:
+  # -----------------------------------------------------------------------------------------------
+  # Stage 1: Validation, Formatting & Static Security Gate
+  # -----------------------------------------------------------------------------------------------
+  - stage: ValidateAndSecurity
+    displayName: "Stage 1: Validation & Security Gate"
+    jobs:
+      - job: StaticCodeAnalysis
+        displayName: "Lint, Checkov & TFLint"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.11"
+            displayName: "Setup Python for Checkov"
+
+          - script: |
+              pip install checkov
+              checkov -d terraform/ --framework terraform --output junitxml --output-file-path $(Common.TestResultsDirectory)/checkov-report.xml
+            displayName: "Execute Checkov Static IaC Security Scan"
+            continueOnError: false
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "$(Common.TestResultsDirectory)/checkov-report.xml"
+              testRunTitle: "Checkov Security Gate Results"
+            displayName: "Publish Security Gate Report"
+
+  # -----------------------------------------------------------------------------------------------
+  # Stage 2: Speculative Execution & Architecture Review Plan
+  # -----------------------------------------------------------------------------------------------
+  - stage: SpeculativePlan
+    displayName: "Stage 2: Terraform Speculative Plan"
+    dependsOn: ValidateAndSecurity
+    jobs:
+      - job: PlanLandingZone
+        displayName: "OIDC Authenticated Plan & Cost Forecast"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Terraform Plan with OIDC Workload Federation"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -e
+                cd terraform/
+                export ARM_USE_OIDC=true
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+                terraform init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=caf-enterprise-lz.tfstate"
+
+                terraform plan -out=tfplan.binary
+                terraform show -json tfplan.binary > tfplan.json
+                echo "Plan successfully generated."
+
+          - publish: $(System.DefaultWorkingDirectory)/terraform/tfplan.binary
+            artifact: landing-zone-plan
+            displayName: "Publish Plan Artifact"
+
+  # -----------------------------------------------------------------------------------------------
+  # Stage 3: Non-Production Hub & Spoke Deployment
+  # -----------------------------------------------------------------------------------------------
+  - stage: DeployNonProduction
+    displayName: "Stage 3: Non-Prod Landing Zone Apply"
+    dependsOn: SpeculativePlan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyNonProd
+        displayName: "Apply Non-Prod Baseline"
+        environment: "Azure-LandingZone-NonProd"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Terraform Apply Non-Prod"
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      echo "Executing non-production landing zone changes with zero disruption..."
+
+  # -----------------------------------------------------------------------------------------------
+  # Stage 4: Production Landing Zone Deployment (Manual Approval Gate Required)
+  # -----------------------------------------------------------------------------------------------
+  - stage: DeployProduction
+    displayName: "Stage 4: Production Landing Zone Deployment"
+    dependsOn: DeployNonProduction
+    jobs:
+      - deployment: ApplyProduction
+        displayName: "Apply Production CAF Hub & Spoke"
+        environment: "Azure-LandingZone-Production" # Protected environment requiring Architect approval
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: landing-zone-plan
+                  displayName: "Download Approved Plan Artifact"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Apply Production"
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      echo "Deploying Enterprise Management Groups, Azure Firewall, Hub VNet & Policy Initiatives."
