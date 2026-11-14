@@ -1,19 +1,13 @@
-name: 'Enterprise Terraform DevSecOps Pipeline'
-
-# ==============================================================================
-# Enterprise GitHub Actions Workflow - azure-devops-enterprise-landing-zone
-# Author: Gunjan Kumar Gaurav (Senior Cloud & DevSecOps Consultant)
-# Shift-Left Security: Checkov, Trivy, TruffleHog & Terraform Validation
-# ==============================================================================
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'terraform/**'
       - '.github/workflows/**'
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'terraform/**'
       - '.github/workflows/**'
@@ -21,40 +15,34 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
-  security-events: write
 
 jobs:
-  validate-and-lint:
-    name: '1. Lint & Format Check'
+  validate:
+    name: Terraform Validate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
 
-      - name: Terraform Format Check
+      - name: Format Check
         run: terraform fmt -check -recursive terraform
 
-      - name: Terraform Init
-        run: terraform -chdir=terraform init -backend=false
+      - name: Init and Validate
+        run: |
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform validate
 
-      - name: Terraform Validate
-        run: terraform -chdir=terraform validate
-
-  security-scan:
-    name: '2. DevSecOps Security Gates'
+  security:
+    name: Security Scan
     runs-on: ubuntu-latest
-    needs: validate-and-lint
+    needs: validate
     steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: TruffleHog Secrets Scanner
+      - name: TruffleHog Secrets Scan
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
@@ -62,36 +50,16 @@ jobs:
           head: HEAD
         continue-on-error: true
 
-      - name: Checkov IaC Security Scanner
+      - name: Checkov Scan
         uses: bridgecrewio/checkov-action@master
         with:
           framework: terraform
           directory: terraform
-          output_format: cli
           soft_fail: true
 
-      - name: Trivy Configuration Vulnerability Scanner
+      - name: Trivy Scan
         uses: aquasecurity/trivy-action@master
         with:
-          scan-type: 'config'
-          scan-ref: 'terraform'
-          format: 'table'
-          exit-code: '0'
-
-  speculative-plan:
-    name: '3. Speculative Verification'
-    runs-on: ubuntu-latest
-    needs: security-scan
-    steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.5
-
-      - name: Verify Terraform Initialization
-        run: |
-          terraform -chdir=terraform init -backend=false
-          echo "Infrastructure blueprint successfully verified."
+          scan-type: config
+          scan-ref: terraform
+          exit-code: 0
